@@ -7,7 +7,7 @@ import time
 from urllib.parse import urlparse
 from requests_oauthlib import OAuth2Session
 from http.server import HTTPServer
-from flask import Flask
+from flask import Flask, session, request
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
@@ -32,7 +32,6 @@ class SimpleSession():
     token_persistance_format = "simple_token_{}.json"
     auth_response_format = "simple_auth_response_{}.json"
 
-
     def __init__(self,
         client_secrets_path=None,
         client_id=None,
@@ -55,7 +54,7 @@ class SimpleSession():
             self.token_uri = self.validate(token_uri,"token_url")
             self.token_refresh_uri = self.validate(token_refresh_uri, "token_refresh_url")
         else:
-            with open(client_secrets_path) as file:
+            with open(os.path.abspath(client_secrets_path)) as file:
                 self.client_secrets_path = client_secrets_path
                 params = list(json.load(file).values())[0]
                 self.client_id = self.validate(params['client_id'], 'client_id')
@@ -72,15 +71,18 @@ class SimpleSession():
             'client_id': self.client_id,
             'client_secret' : self.client_secret
         }
-        self.token_path = os.path.join(os.path.dirname(__file__),SimpleSession.token_persistance_format.format(self._get_file_name_from_arguments()))
-        self.auth_response_path = os.path.join(os.path.dirname(__file__),SimpleSession.auth_response_format.format(self._get_file_name_from_arguments()))
-        self.simple_certificate_path = certificate or os.path.join(os.path.dirname(__file__),'simple_certificate.pem')
-        self.simple_key_path = key or os.path.join(os.path.dirname(__file__),'simple_key.pem')
-        self.simple_key = None
-        self.internal_session = requests.Session()
-        self.cert_pair= (self.simple_certificate_path,self.simple_key_path)
-
+        parse_result = urlparse(self.redirect_uri)
+        self.hostname = parse_result.hostname
+        self.port = parse_result.port
+        
         #Finish validating input parameters
+
+        # Set up token, response, certificate, and key paths
+        self._setup_paths(certificate,key)
+        self._load_ssl_credentials()
+
+        self._internal_session = requests.Session()
+        self._internal_session.cert = self.cert
 
         # Try loading token from persistant storage
         self._try_load_token()
@@ -92,26 +94,31 @@ class SimpleSession():
             # 2. Create local https server for managing redirect from token provider
             self._create_redirect_handler()
 
-            # 3. Try loading key and certificate. If not found, then generate defaults
-            self._load_ssl_credentials()
-
-            # 4. Open the authorization url and set up the server to handle the authorization reponse
+            # 3. Open the authorization url and set up the server to handle the authorization reponse
             self._get_authorization_code()
 
-            # 5. Load the auth response from the server from the file system.
-            # Saving/loading from file system is the only way I've found to
-            # communicate between the custom SimpleServer and the SimpleSession
-            # because the HTTPServer instantiates a new SimpleServer for every request
-            self._load_authorization_code()
+            # 4. Once we have confirmed received the token, clean up the server used for handling OAuth
+            self._clean_up_handler()
 
-            # 6. Get the token
-            self._load_token_from_authorization()
-
-            # 7. Create a session with automatic token refereshing
+            # 4. Create a session with automatic token refereshing
             self._create_token_renewing_session()
 
         self._handle_caching()
         self._handle_persistent_storage()
+
+
+    def _setup_paths(self,certificate, key):
+        self.token_path = os.path.join(os.path.dirname(__file__),SimpleSession.token_persistance_format.format(self._get_file_name_from_arguments()))
+        self.simple_certificate_path = certificate or os.path.join(os.path.dirname(__file__),'simple_certificate.pem')
+        self.simple_key_path = key or os.path.join(os.path.dirname(__file__),'simple_key.pem')
+        self.simple_key = None
+        self.cert = (self.simple_certificate_path,self.simple_key_path)
+
+    def _load_ssl_credentials(self):
+        if not os.path.isfile(self.simple_key_path):
+            self.generate_key()
+        if not os.path.isfile(self.simple_certificate_path):
+            self.generate_certificate()
 
     def _create_authorization_session(self):
         self.oauth2Session = OAuth2Session(self.client_id, redirect_uri=self.redirect_uri,scope=self.scope)
@@ -121,60 +128,41 @@ class SimpleSession():
         )
 
     def _create_redirect_handler(self):
-        parse_result = urlparse(self.redirect_uri)
-        self.server_address = (parse_result.hostname, parse_result.port)
-        self.httpd = HTTPServer(self.server_address, SimpleServer)
-        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); 
+        self.app = Flask(__name__)
+        self.app.add_url_rule('/','index',self._handle_authorization_code)
+        self.app.add_url_rule('/shutdown','shutdown', self._handle_shutdown)
+        
+    def _handle_authorization_code(self):
+        if request.args.get('state') is None or request.args.get('code') is None:
+            return
+        self.oauth2Session = OAuth2Session(self.client_id,state=self.state,redirect_uri=self.redirect_uri)
+        self.token = self.oauth2Session.fetch_token(self.token_uri,client_secret=self.client_secret,authorization_response=request.url)
+        self.auth_processed_event.set()
+        return "Thank you! You are authenticated. You may close the window."
 
-    def _load_ssl_credentials(self):
-        if not os.path.isfile(self.simple_key_path):
-            self.generate_key()
-        if not os.path.isfile(self.simple_certificate_path):
-            self.generate_certificate()
-
-        self.context.load_cert_chain(self.simple_certificate_path, self.simple_key_path)
-        self.httpd.socket = self.context.wrap_socket(self.httpd.socket,server_side=True)
+    def _handle_shutdown(self):
+        print('shutting down')
+        shutdown = request.environ.get('werkzeug.server.shutdown')
+        if shutdown is None:
+            raise RuntimeError('Not running with the Werkzeug Server')
+        shutdown()
+        return "Server shutting down..."
 
     def _get_authorization_code(self):
-        self.server_thread = threading.Thread(target=self.httpd.serve_forever)
+        
+        self.auth_processed_event = threading.Event()
+        server_args = {
+            'host':self.hostname,
+            'port':self.port,
+            'ssl_context': self.cert
+        }
+        self.server_thread = threading.Thread(target=self.app.run,kwargs=server_args)
         self.server_thread.start()
-        server_success = False
-        while not server_success:
-            try:
-                self.internal_session.post(
-                    'https://{}:{}'.format(self.server_address[0],self.server_address[1]),
-                    params={
-                        'auth_response_path': self.auth_response_path
-                    },
-                    cert=self.cert_pair
-                )
-                server_success = True
-            except Exception as e:
-                # Could not post the auth response path to the server
-                # Try again in 5 seconds
-                time.sleep(5)
-
         webbrowser.open(self.authorization_url)
 
-    def _load_authorization_code(self):
-        load_success = False
-        while not load_success:
-            try:
-                self.auth_response = json.load(open(self.auth_response_path))
-                load_success = True
-            except Exception as e:
-                # Could not load the auth response.
-                # Wait for writing to file to finish
-                time.sleep(5)
-        self.httpd.shutdown()
-        self.server_thread.join()
-
-    def _load_token_from_authorization(self):
-        self.token = self.oauth2Session.fetch_token(
-            self.token_uri,
-            code=self.auth_response['code'][0],
-            client_secret=self.client_secret
-        )
+    def _clean_up_handler(self):
+        self.auth_processed_event.wait()
+        self._internal_session.get("https://{}:{}/shutdown".format(self.hostname,self.port),verify=self.simple_certificate_path)
 
     def _create_token_renewing_session(self):
         self.oauth2Session = OAuth2Session(
@@ -189,8 +177,12 @@ class SimpleSession():
         self.token = token
 
     def _persist_token(self):
-        with open(self.token_path,'w') as outfile:
-            json.dump(self.token,outfile, indent=4)
+        if self.token is not None:
+            try:
+                with open(self.token_path,'x') as outfile:
+                    json.dump(self.token,outfile, indent=4)
+            except:
+                pass
 
     def _try_load_token(self):
         try:
@@ -273,19 +265,18 @@ class SimpleSession():
     def delete_certificate(self):
         os.remove(self.simple_certificate_path)
 
-    def _delete_auth_response(self):
-        os.remove(self.auth_response_path)
-
     def nuke(self):
         self.delete_token()
         self.delete_key()
         self.delete_certificate()
-        self._delete_auth_response()
 
     def _handle_caching(self):
-        if type(self.cache) is "str" and self.cache.lower() is "dict":
+        if isinstance(self.cache,str) and self.cache.lower() == "dict":
             from cachecontrol import CacheControl
             self.oauth2Session = CacheControl(self.oauth2Session)
+            self.oauth2Session.headers.update({
+                'Cache-Control': 'max-age=60'
+            })
 
     def _handle_persistent_storage(self):
         atexit.register(self._persist_token)
